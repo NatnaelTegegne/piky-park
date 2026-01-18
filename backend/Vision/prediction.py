@@ -1,218 +1,137 @@
-<<<<<<< HEAD
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
-from PIL import Image
-import cv2
-import csv
+from PIL import Image, ImageStat    
+import os
 
 # --- CONFIGURATION ---
-MODEL_PATH = 'parking_model.pth'
-IMAGE_PATH = 'vlcsnap-2026-01-18-00h46m52s266.png'  # The image you want to check
-# List all CSVs you want to monitor. Usually, you want to monitor ALL spots.
-CSV_FILES = ['empty_test.csv', 'occupied_test.csv'] 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- 1. LOAD THE MODEL ---
 def load_model():
-    # We must redefine the model structure exactly as we did in training
-    model = models.resnet50(weights='DEFAULT') # Pretrained doesn't matter here, we are loading weights
-    num_features = model.fc.in_features
-    model.fc = nn.Linear(num_features, 2) # Output layer (Empty vs Full)
+    print(f"🔄 Loading Model on {DEVICE}...")
     
-    # Load the trained weights
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    model.to(DEVICE)
-    model.eval() # Set to evaluation mode (important!)
-    return model
+    model = models.resnet50(weights='DEFAULT')
+    num_features = model.fc.in_features
+    model.fc = nn.Linear(num_features, 2) 
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(current_dir, 'parking_model.pth')
+    
+    try:
+        model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        model.to(DEVICE)
+        model.eval() 
+        print("✅ Model Loaded Successfully!")
+        return model
+    except FileNotFoundError:
+        print(f"❌ ERROR: Could not find model at {model_path}")
+        return None
 
 # --- 2. DEFINE TRANSFORM ---
-# Must match the transform used during training
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# --- 3. PREDICTION FUNCTION ---
-def predict_spot(model, crop_img):
-    # Convert OpenCV image (BGR) to PIL Image (RGB)
-    crop_img = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(crop_img)
-    
-    # Prepare image for model
-    input_tensor = transform(pil_img).unsqueeze(0).to(DEVICE) # Add batch dimension
-    
-    with torch.no_grad(): # Disable gradient calculation for speed
+# --- 3. PREDICTION FUNCTION (Internal) ---
+def predict_single_crop(model, pil_crop):
+    input_tensor = transform(pil_crop).unsqueeze(0).to(DEVICE) 
+    with torch.no_grad():
         outputs = model(input_tensor)
-        # Get the index of the highest score (0 or 1)
+        # Apply Softmax to get probabilities (confidence)
+        probs = torch.nn.functional.softmax(outputs, dim=1)
+        
+        occupied_confidence = probs[0][1].item()
+        # THRESHOLD = 0.95
+        # if occupied_confidence > THRESHOLD:
+        #     return 1 # Occupied
+        # else:
+        #     return 0 # Free
+        # probs[0][0] = Confidence it's EMPTY
+        # probs[0][1] = Confidence it's OCCUPIED
+        
+        # We can adjust threshold here if needed (e.g., > 0.7 to count as occupied)
         _, predicted = torch.max(outputs, 1)
         
     return predicted.item()
-
-# --- 4. MAIN LOOP ---
-def main():
-    model = load_model()
-    image = cv2.imread(IMAGE_PATH)
-    image = cv2.resize(image, None, fx=.5,fy=.5)
+def is_flat_asphalt(pil_crop, threshold=40):
+    """
+    Returns True if the image is 'boring' (low contrast/variation).
+    Cars have high variation (glass, metal, shadow).
+    Asphalt has low variation.
+    """
+    # Convert to Grayscale
+    gray_img = pil_crop.convert('L')
+    # Calculate Standard Deviation (Variance of pixel brightness)
+    stat = ImageStat.Stat(gray_img)
+    std_dev = stat.stddev[0]
     
-    # Combine coordinates from all CSVs into one list
-    all_spots = []
-    for csv_file in CSV_FILES:
-        with open(csv_file, 'r') as f:
-            reader = list(csv.reader(f))
-            for i in range(0, len(reader), 2):
-                if i+1 < len(reader):
-                    p1 = tuple(map(int, reader[i]))
-                    p2 = tuple(map(int, reader[i+1]))
-                    all_spots.append((p1, p2))
+    # Debug print (Uncomment to tune!)
+    # print(f"StdDev: {std_dev:.2f}")
 
-    print(f"Checking {len(all_spots)} parking spots...")
+    # If variation is LOW, it's likely just road.
+    if std_dev < threshold:
+        return True
+    return False
 
-    # Iterate over every spot
-    for p1, p2 in all_spots:
-        x1, y1 = p1
-        x2, y2 = p2
-        
-        # Ensure coordinates are ordered correctly for slicing
-        x_start, x_end = sorted([x1, x2])
-        y_start, y_end = sorted([y1, y2])
-        
-        # Crop the spot
-        spot_crop = image[y_start:y_end, x_start:x_end]
-        
-        # Check if crop is valid (not 0 size)
-        if spot_crop.size == 0: continue
+# --- 4. PUBLIC API FUNCTION ---
+def analyze_frame(image_file, spots_config, model):
+    if not model:
+        return {}
 
-        # Predict
-        prediction = predict_spot(model, spot_crop)
-        
-        # Draw Result
-        # Assumption: 0 = Empty, 1 = Occupied (Check your training class_to_idx to be sure!)
-        # Usually ImageFolder sorts alphabetically: Empty=0, Occupied=1
-        if prediction == 0: 
-            color = (0, 255, 0) # Green for Empty
-            label = "Empty"
-        else:
-            color = (0, 0, 255) # Red for Occupied
-            label = "Occupied"
+    # 1. Open Image
+    try:
+        full_image = Image.open(image_file).convert('RGB')
+    except Exception as e:
+        print(f"❌ Error opening image file: {e}")
+        return {}
+
+    results = {}
+
+    # 2. Iterate through all spots
+    for spot_id, spot_data in spots_config.items():
+        try:
+            # --- SAFETY CHECK ---
+            if not isinstance(spot_data, dict): continue
+            coords = spot_data.get('coords') 
+            if not coords or len(coords) != 4: continue
+            # --------------------
+
+            # Map to Integers
+            x1, y1, x2, y2 = map(int, coords)
             
-        cv2.rectangle(image, p1, p2, color, 2)
-
-    # Show the final result
-    print("done")
-    cv2.imshow("Parking Prediction", image)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-=======
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
-from PIL import Image
-import cv2
-import csv
-
-# --- CONFIGURATION ---
-MODEL_PATH = 'parking_model.pth'
-IMAGE_PATH = 'vlcsnap-2026-01-18-00h46m52s266.png'  # The image you want to check
-# List all CSVs you want to monitor. Usually, you want to monitor ALL spots.
-CSV_FILES = ['empty_test.csv', 'occupied_test.csv'] 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# --- 1. LOAD THE MODEL ---
-def load_model():
-    # We must redefine the model structure exactly as we did in training
-    model = models.resnet50(weights='DEFAULT') # Pretrained doesn't matter here, we are loading weights
-    num_features = model.fc.in_features
-    model.fc = nn.Linear(num_features, 2) # Output layer (Empty vs Full)
-    
-    # Load the trained weights
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    model.to(DEVICE)
-    model.eval() # Set to evaluation mode (important!)
-    return model
-
-# --- 2. DEFINE TRANSFORM ---
-# Must match the transform used during training
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-
-# --- 3. PREDICTION FUNCTION ---
-def predict_spot(model, crop_img):
-    # Convert OpenCV image (BGR) to PIL Image (RGB)
-    crop_img = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(crop_img)
-    
-    # Prepare image for model
-    input_tensor = transform(pil_img).unsqueeze(0).to(DEVICE) # Add batch dimension
-    
-    with torch.no_grad(): # Disable gradient calculation for speed
-        outputs = model(input_tensor)
-        # Get the index of the highest score (0 or 1)
-        _, predicted = torch.max(outputs, 1)
-        
-    return predicted.item()
-
-# --- 4. MAIN LOOP ---
-def main():
-    model = load_model()
-    image = cv2.imread(IMAGE_PATH)
-    image = cv2.resize(image, None, fx=.5,fy=.5)
-    
-    # Combine coordinates from all CSVs into one list
-    all_spots = []
-    for csv_file in CSV_FILES:
-        with open(csv_file, 'r') as f:
-            reader = list(csv.reader(f))
-            for i in range(0, len(reader), 2):
-                if i+1 < len(reader):
-                    p1 = tuple(map(int, reader[i]))
-                    p2 = tuple(map(int, reader[i+1]))
-                    all_spots.append((p1, p2))
-
-    print(f"Checking {len(all_spots)} parking spots...")
-
-    # Iterate over every spot
-    for p1, p2 in all_spots:
-        x1, y1 = p1
-        x2, y2 = p2
-        
-        # Ensure coordinates are ordered correctly for slicing
-        x_start, x_end = sorted([x1, x2])
-        y_start, y_end = sorted([y1, y2])
-        
-        # Crop the spot
-        spot_crop = image[y_start:y_end, x_start:x_end]
-        
-        # Check if crop is valid (not 0 size)
-        if spot_crop.size == 0: continue
-
-        # Predict
-        prediction = predict_spot(model, spot_crop)
-        
-        # Draw Result
-        # Assumption: 0 = Empty, 1 = Occupied (Check your training class_to_idx to be sure!)
-        # Usually ImageFolder sorts alphabetically: Empty=0, Occupied=1
-        if prediction == 0: 
-            color = (0, 255, 0) # Green for Empty
-            label = "Empty"
-        else:
-            color = (0, 0, 255) # Red for Occupied
-            label = "Occupied"
+            # We cut 15 pixels off every side to avoid "seeing" neighbor cars
+            # This forces the AI to look at the center of the spot
+            margin = 15 
             
-        cv2.rectangle(image, p1, p2, color, 2)
+            crop_x1 = x1 + margin
+            crop_y1 = y1 + margin
+            crop_x2 = x2 - margin
+            crop_y2 = y2 - margin
+            
+            # Safety: If spot is too small, revert to original size
+            if crop_x1 >= crop_x2 or crop_y1 >= crop_y2:
+                crop_x1, crop_y1, crop_x2, crop_y2 = x1, y1, x2, y2
 
-    # Show the final result
-    print("done")
-    cv2.imshow("Parking Prediction", image)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+            # Crop using the shrunken coordinates
+            spot_crop = full_image.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+            
+            if spot_crop.size == (0,0):
+                results[spot_id] = "free"
+                continue
+            if is_flat_asphalt(spot_crop, threshold=25):
+                results[spot_id] = "free"
+                continue
+            # Predict
+            prediction = predict_single_crop(model, spot_crop)
+            
+            status = "free" if prediction == 0 else "occupied"
+            results[spot_id] = status
+            
+        except Exception as e:
+            print(f"❌ CRITICAL ERROR processing {spot_id}: {e}")
+            results[spot_id] = "free"
 
-if __name__ == "__main__":
->>>>>>> ba34fcc6b10f808adbb79bbf31433af76b00ad4c
-    main()
+    return results
