@@ -1,0 +1,31 @@
+{
+  "parkingSpots": [
+    {
+      "id": 1,
+      "lng": -122.4194,
+      "lat": 37.7749,
+      "name": "Union Square Garage",
+      "address": "333 Post St, San Francisco, CA 94108",
+      "spotsAvailable": 0,
+      "totalSpots": 50
+    },
+    {
+      "id": 2,
+      "lng": -122.4074,
+      "lat": 37.7849,
+      "name": "Sutter-Stockton Garage",
+      "address": "444 Stockton St, San Francisco, CA 94108",
+      "spotsAvailable": 25,
+      "totalSpots": 75
+    },
+    {
+      "id": 3,
+      "lng": -122.4034,
+      "lat": 37.7949,
+      "name": "North Beach Garage",
+      "address": "735 Vallejo St, San Francisco, CA 94133",
+      "spotsAvailable": 1,
+      "totalSpots": 20
+    }
+  ]
+}
