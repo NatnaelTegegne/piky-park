@@ -1,0 +1,24 @@
+# System junk
+.DS_Store
+Thumbs.db
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node / Frontend
+node_modules/
+build/
+.env
+
+
+*.mp4
+*.mov
+vision/videos/
+
+get_coordinates.py
+
+Vision/
+user-map/
+backend/
